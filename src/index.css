@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+@theme {
+  --color-dark-bg: #0a0f1c;
+  --color-dark-card: #111827;
+  --color-dark-border: #1e293b;
+  --color-accent: #3b82f6;
+  --color-accent-hover: #2563eb;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #1e293b #0a0f1c;
+}
+
+body {
+  margin: 0;
+  background: #0a0f1c;
+  color: #e2e8f0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
