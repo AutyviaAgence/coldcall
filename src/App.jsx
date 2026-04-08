@@ -80,10 +80,12 @@ function isToday(d) {
 }
 
 // ─── SERPAPI SCRAPER MODAL ───
-function SerpScraperModal({ isOpen, onClose, onImport }) {
+function SerpScraperModal({ isOpen, onClose, onImport, tags, onAddTag }) {
   const [query, setQuery] = useState('')
   const [location, setLocation] = useState('France')
   const [engine, setEngine] = useState('google_maps')
+  const [importTags, setImportTags] = useState([])
+  const [newImportTag, setNewImportTag] = useState('')
   const [results, setResults] = useState([])
   const [selected, setSelected] = useState(new Set())
   const [loading, setLoading] = useState(false)
@@ -92,12 +94,25 @@ function SerpScraperModal({ isOpen, onClose, onImport }) {
   const [hasMore, setHasMore] = useState(false)
   const [totalSearched, setTotalSearched] = useState(0)
   const [siteFilter, setSiteFilter] = useState('tous') // 'tous' | 'sans_site' | 'avec_site'
+  const [phoneFilter, setPhoneFilter] = useState('tous') // 'tous' | 'mobile' | 'fixe'
+  const [maxResults, setMaxResults] = useState(60)
+  const [loadingProgress, setLoadingProgress] = useState('')
+  const abortRef = useRef(false)
+
+  const isMobile = (tel) => {
+    if (!tel) return false
+    const clean = tel.replace(/[\s.\-()]/g, '')
+    return /^(\+33|0033)?0?[67]/.test(clean) || /^0[67]/.test(clean)
+  }
 
   const filteredResults = useMemo(() => {
-    if (siteFilter === 'sans_site') return results.filter(r => !r.siteWeb)
-    if (siteFilter === 'avec_site') return results.filter(r => !!r.siteWeb)
-    return results
-  }, [results, siteFilter])
+    let list = results
+    if (siteFilter === 'sans_site') list = list.filter(r => !r.siteWeb)
+    else if (siteFilter === 'avec_site') list = list.filter(r => !!r.siteWeb)
+    if (phoneFilter === 'mobile') list = list.filter(r => isMobile(r.telephone))
+    else if (phoneFilter === 'fixe') list = list.filter(r => r.telephone && !isMobile(r.telephone))
+    return list
+  }, [results, siteFilter, phoneFilter])
 
   const reset = () => {
     setResults([])
@@ -106,13 +121,23 @@ function SerpScraperModal({ isOpen, onClose, onImport }) {
     setPage(0)
     setHasMore(false)
     setTotalSearched(0)
+    setImportTags([])
+    setNewImportTag('')
   }
 
-  const doSearch = async (pageNum = 0) => {
-    if (!query.trim()) return
-    setLoading(true)
-    setError('')
+  const addImportTag = (tag) => {
+    const t = tag.trim()
+    if (!t || importTags.includes(t)) return
+    setImportTags(prev => [...prev, t])
+    onAddTag(t)
+    setNewImportTag('')
+  }
 
+  const removeImportTag = (tag) => {
+    setImportTags(prev => prev.filter(t => t !== tag))
+  }
+
+  const fetchPage = async (pageNum) => {
     const key = getNextSerpKey()
     const params = new URLSearchParams({
       api_key: key,
@@ -124,7 +149,7 @@ function SerpScraperModal({ isOpen, onClose, onImport }) {
     if (engine === 'google_maps') {
       params.set('engine', 'google_maps')
       params.set('type', 'search')
-      params.set('ll', '@46.603354,1.888334,6z') // center of France
+      params.set('ll', '@46.603354,1.888334,6z')
       if (location.trim()) params.set('q', `${query.trim()} ${location.trim()}`)
       if (pageNum > 0) params.set('start', String(pageNum * 20))
     } else {
@@ -134,37 +159,25 @@ function SerpScraperModal({ isOpen, onClose, onImport }) {
       if (pageNum > 0) params.set('start', String(pageNum * 20))
     }
 
-    try {
-      const resp = await fetch(`/serpapi/search.json?${params.toString()}`)
-      if (!resp.ok) {
-        const text = await resp.text()
-        if (resp.status === 429 || text.includes('rate limit')) {
-          // Try next key
-          const key2 = getNextSerpKey()
-          params.set('api_key', key2)
-          const resp2 = await fetch(`/serpapi/search.json?${params.toString()}`)
-          if (!resp2.ok) throw new Error(`Erreur API: ${resp2.status}`)
-          const data2 = await resp2.json()
-          processResults(data2, pageNum)
-          return
-        }
-        throw new Error(`Erreur API: ${resp.status} - ${text.slice(0, 200)}`)
+    const resp = await fetch(`/serpapi/search.json?${params.toString()}`)
+    if (!resp.ok) {
+      const text = await resp.text()
+      if (resp.status === 429 || text.includes('rate limit')) {
+        const key2 = getNextSerpKey()
+        params.set('api_key', key2)
+        const resp2 = await fetch(`/serpapi/search.json?${params.toString()}`)
+        if (!resp2.ok) throw new Error(`Erreur API: ${resp2.status}`)
+        return resp2.json()
       }
-      const data = await resp.json()
-      processResults(data, pageNum)
-    } catch (err) {
-      setError(err.message || 'Erreur de connexion à SerpAPI')
-    } finally {
-      setLoading(false)
+      throw new Error(`Erreur API: ${resp.status} - ${text.slice(0, 200)}`)
     }
+    return resp.json()
   }
 
-  const processResults = (data, pageNum) => {
-    let items = []
-
+  const parseItems = (data) => {
     if (engine === 'google_maps') {
-      const places = data.local_results || data.place_results ? [data.place_results] : []
-      items = (data.local_results || places).map(p => ({
+      const places = data.local_results || (data.place_results ? [data.place_results] : [])
+      return places.map(p => ({
         _id: p.place_id || generateId(),
         entreprise: p.title || '',
         telephone: p.phone || '',
@@ -176,7 +189,7 @@ function SerpScraperModal({ isOpen, onClose, onImport }) {
         gps: p.gps_coordinates || null,
       }))
     } else {
-      items = (data.organic_results || []).map(r => ({
+      return (data.organic_results || []).map(r => ({
         _id: r.position?.toString() || generateId(),
         entreprise: r.title || '',
         telephone: '',
@@ -187,21 +200,67 @@ function SerpScraperModal({ isOpen, onClose, onImport }) {
         type: 'web',
       }))
     }
+  }
 
-    if (pageNum === 0) {
-      setResults(items)
-      setTotalSearched(items.length)
-    } else {
-      setResults(prev => {
-        const existingIds = new Set(prev.map(r => r._id))
-        const newItems = items.filter(i => !existingIds.has(i._id))
-        return [...prev, ...newItems]
-      })
-      setTotalSearched(prev => prev + items.length)
+  const doSearch = async () => {
+    if (!query.trim()) return
+    setLoading(true)
+    setError('')
+    setResults([])
+    setTotalSearched(0)
+    setSelected(new Set())
+    abortRef.current = false
+
+    const allItems = []
+    const seenIds = new Set()
+    const totalPages = Math.ceil(maxResults / 20)
+
+    try {
+      for (let p = 0; p < totalPages; p++) {
+        if (abortRef.current) break
+        setLoadingProgress(`Page ${p + 1}/${totalPages} — ${allItems.length} résultats...`)
+
+        const data = await fetchPage(p)
+        const items = parseItems(data)
+
+        const newItems = items.filter(i => !seenIds.has(i._id))
+        newItems.forEach(i => { seenIds.add(i._id); allItems.push(i) })
+
+        setResults([...allItems])
+        setTotalSearched(allItems.length)
+
+        if (items.length < 5) break // plus de résultats disponibles
+        if (allItems.length >= maxResults) break
+      }
+      setHasMore(allItems.length >= maxResults)
+      setPage(Math.ceil(allItems.length / 20) - 1)
+    } catch (err) {
+      setError(err.message || 'Erreur de connexion à SerpAPI')
+    } finally {
+      setLoading(false)
+      setLoadingProgress('')
     }
+  }
 
-    setHasMore(items.length >= 15)
-    setPage(pageNum)
+  const handleLoadMore = async () => {
+    const nextPage = page + 1
+    setLoading(true)
+    setLoadingProgress('Chargement...')
+    try {
+      const data = await fetchPage(nextPage)
+      const items = parseItems(data)
+      const existingIds = new Set(results.map(r => r._id))
+      const newItems = items.filter(i => !existingIds.has(i._id))
+      setResults(prev => [...prev, ...newItems])
+      setTotalSearched(prev => prev + newItems.length)
+      setHasMore(items.length >= 5)
+      setPage(nextPage)
+    } catch (err) {
+      setError(err.message || 'Erreur')
+    } finally {
+      setLoading(false)
+      setLoadingProgress('')
+    }
   }
 
   const extractVille = (address) => {
@@ -250,17 +309,15 @@ function SerpScraperModal({ isOpen, onClose, onImport }) {
         dateDernierAppel: null,
         dateRappel: null,
         notes: r.note ? [{ id: generateId(), date: new Date().toISOString(), texte: `[SerpAPI] ${r.note}` }] : [],
+        tags: [...importTags],
         historiqueAppels: [],
         fichierSource: `SerpAPI: "${query}"`,
         dateImport: new Date().toISOString(),
       }))
+    importTags.forEach(t => onAddTag(t))
     onImport(contacts)
     reset()
     onClose()
-  }
-
-  const handleLoadMore = () => {
-    doSearch(page + 1)
   }
 
   if (!isOpen) return null
@@ -290,7 +347,7 @@ function SerpScraperModal({ isOpen, onClose, onImport }) {
                   type="text"
                   value={query}
                   onChange={e => setQuery(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter') { reset(); doSearch(0) } }}
+                  onKeyDown={e => { if (e.key === 'Enter') doSearch() }}
                   placeholder="ex: plombier, restaurant italien, agence web..."
                   className="w-full bg-[#0a0f1c] border border-[#1e293b] rounded-lg pl-9 pr-3 py-2 text-sm text-white placeholder-gray-600 focus:border-[#3b82f6] focus:outline-none"
                 />
@@ -309,7 +366,7 @@ function SerpScraperModal({ isOpen, onClose, onImport }) {
                 />
               </div>
             </div>
-            <div className="w-44">
+            <div className="w-36">
               <label className="text-xs text-gray-500 mb-1 block">Moteur</label>
               <select
                 value={engine}
@@ -320,40 +377,81 @@ function SerpScraperModal({ isOpen, onClose, onImport }) {
                 <option value="google">Google Search</option>
               </select>
             </div>
+            <div className="w-24">
+              <label className="text-xs text-gray-500 mb-1 block">Résultats</label>
+              <select
+                value={maxResults}
+                onChange={e => setMaxResults(Number(e.target.value))}
+                className="w-full bg-[#0a0f1c] border border-[#1e293b] rounded-lg px-3 py-2 text-sm text-white focus:border-[#3b82f6] focus:outline-none"
+              >
+                <option value={20}>20</option>
+                <option value={40}>40</option>
+                <option value={60}>60</option>
+                <option value={100}>100</option>
+                <option value={200}>200</option>
+              </select>
+            </div>
             <div className="flex items-end">
               <button
-                onClick={() => { reset(); doSearch(0) }}
+                onClick={() => doSearch()}
                 disabled={loading || !query.trim()}
                 className="bg-[#3b82f6] hover:bg-[#2563eb] disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors"
               >
                 {loading ? <Loader2 size={16} className="animate-spin" /> : <Search size={16} />}
-                Rechercher
+                {loading ? loadingProgress || 'Recherche...' : 'Rechercher'}
               </button>
+              {loading && (
+                <button onClick={() => { abortRef.current = true }} className="ml-2 text-gray-400 hover:text-red-400 text-xs">
+                  Stop
+                </button>
+              )}
             </div>
           </div>
           <div className="flex items-center justify-between flex-wrap gap-2">
             <p className="text-xs text-gray-600">
               Rotation automatique des clés API ({SERPAPI_KEYS.length} clés configurées)
             </p>
-            <div className="flex items-center gap-1.5">
-              <Globe size={12} className="text-gray-500" />
-              {[
-                { value: 'tous', label: 'Tous' },
-                { value: 'sans_site', label: 'Sans site web' },
-                { value: 'avec_site', label: 'Avec site web' },
-              ].map(opt => (
-                <button
-                  key={opt.value}
-                  onClick={() => setSiteFilter(opt.value)}
-                  className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-                    siteFilter === opt.value
-                      ? 'bg-[#3b82f6] text-white'
-                      : 'bg-[#0a0f1c] text-gray-400 hover:text-white border border-[#1e293b]'
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              ))}
+            <div className="flex items-center gap-3 flex-wrap">
+              <div className="flex items-center gap-1.5">
+                <Globe size={12} className="text-gray-500" />
+                {[
+                  { value: 'tous', label: 'Tous' },
+                  { value: 'sans_site', label: 'Sans site web' },
+                  { value: 'avec_site', label: 'Avec site web' },
+                ].map(opt => (
+                  <button
+                    key={opt.value}
+                    onClick={() => setSiteFilter(opt.value)}
+                    className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                      siteFilter === opt.value
+                        ? 'bg-[#3b82f6] text-white'
+                        : 'bg-[#0a0f1c] text-gray-400 hover:text-white border border-[#1e293b]'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Phone size={12} className="text-gray-500" />
+                {[
+                  { value: 'tous', label: 'Tous' },
+                  { value: 'mobile', label: '06/07 uniquement' },
+                  { value: 'fixe', label: 'Fixe uniquement' },
+                ].map(opt => (
+                  <button
+                    key={opt.value}
+                    onClick={() => setPhoneFilter(opt.value)}
+                    className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                      phoneFilter === opt.value
+                        ? 'bg-emerald-600 text-white'
+                        : 'bg-[#0a0f1c] text-gray-400 hover:text-white border border-[#1e293b]'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
         </div>
@@ -469,16 +567,53 @@ function SerpScraperModal({ isOpen, onClose, onImport }) {
 
         {/* Footer */}
         {results.length > 0 && (
-          <div className="p-4 border-t border-[#1e293b] flex items-center justify-between">
-            <span className="text-xs text-gray-500">{totalSearched} résultats trouvés</span>
-            <button
-              onClick={handleImport}
-              disabled={selected.size === 0}
-              className="bg-[#3b82f6] hover:bg-[#2563eb] disabled:opacity-50 disabled:cursor-not-allowed text-white px-6 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors"
-            >
-              <Plus size={16} />
-              Importer {selected.size} contact{selected.size > 1 ? 's' : ''}
-            </button>
+          <div className="p-4 border-t border-[#1e293b] space-y-3">
+            {/* Tags à appliquer */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-xs text-gray-500 flex items-center gap-1"><Tag size={12} /> Tags à appliquer :</span>
+              {importTags.map((t, i) => (
+                <span key={t} className={`px-2 py-0.5 rounded-full text-xs font-medium text-white flex items-center gap-1 ${TAG_COLORS[tags.indexOf(t) >= 0 ? tags.indexOf(t) % TAG_COLORS.length : i % TAG_COLORS.length]}`}>
+                  {t}
+                  <button onClick={() => removeImportTag(t)} className="hover:text-red-300"><X size={10} /></button>
+                </span>
+              ))}
+              {tags.filter(t => !importTags.includes(t)).map((t, i) => (
+                <button
+                  key={t}
+                  onClick={() => addImportTag(t)}
+                  className="px-2 py-0.5 rounded-full text-xs border border-dashed border-[#1e293b] text-gray-500 hover:text-white hover:border-[#3b82f6] transition-colors"
+                >
+                  + {t}
+                </button>
+              ))}
+              <div className="flex items-center gap-1">
+                <input
+                  type="text"
+                  value={newImportTag}
+                  onChange={e => setNewImportTag(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') addImportTag(newImportTag) }}
+                  placeholder="Nouveau tag..."
+                  className="bg-[#0a0f1c] border border-[#1e293b] rounded-lg px-2 py-1 text-xs text-white placeholder-gray-600 focus:border-[#3b82f6] focus:outline-none w-28"
+                />
+                <button
+                  onClick={() => addImportTag(newImportTag)}
+                  className="bg-[#1e293b] hover:bg-[#2d3a4f] text-white px-1.5 py-1 rounded-lg text-xs"
+                >
+                  <Plus size={12} />
+                </button>
+              </div>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-gray-500">{totalSearched} résultats trouvés</span>
+              <button
+                onClick={handleImport}
+                disabled={selected.size === 0}
+                className="bg-[#3b82f6] hover:bg-[#2563eb] disabled:opacity-50 disabled:cursor-not-allowed text-white px-6 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors"
+              >
+                <Plus size={16} />
+                Importer {selected.size} contact{selected.size > 1 ? 's' : ''}
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -811,6 +946,10 @@ function ContactPanel({ contact, onClose, onUpdate, tags, onAddTag }) {
   if (!contact) return null
 
   const handleStatut = (statut) => {
+    if (statut === STATUTS.NON_APPELE) {
+      onUpdate(contact.id, { statut, dateRappel: null })
+      return
+    }
     const appel = {
       id: generateId(),
       date: new Date().toISOString(),
@@ -1005,7 +1144,7 @@ function ContactPanel({ contact, onClose, onUpdate, tags, onAddTag }) {
           <div>
             <h3 className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2">Changer le statut</h3>
             <div className="grid grid-cols-2 gap-2">
-              {Object.values(STATUTS).filter(s => s !== STATUTS.NON_APPELE).map(statut => {
+              {Object.values(STATUTS).map(statut => {
                 const SIcon = STATUT_ICONS[statut]
                 return (
                   <button
@@ -1269,7 +1408,30 @@ export default function App() {
   }, [checkedIds, handleAddTag])
 
   const handleImportContacts = useCallback((newContacts) => {
-    setContacts(prev => [...prev, ...newContacts])
+    setContacts(prev => {
+      const normPhone = (t) => (t || '').replace(/[\s.\-()+]/g, '').replace(/^0033/, '0').replace(/^33/, '0')
+      const normStr = (s) => (s || '').toLowerCase().trim()
+      const keyOf = (c) => {
+        const phone = normPhone(c.telephone)
+        if (phone && phone.length >= 8) return `tel:${phone}`
+        const email = normStr(c.email)
+        if (email) return `email:${email}`
+        return `name:${normStr(c.entreprise)}|${normStr(c.ville)}`
+      }
+      const existingKeys = new Set(prev.map(keyOf))
+      const added = []
+      let duplicates = 0
+      for (const c of newContacts) {
+        const k = keyOf(c)
+        if (existingKeys.has(k)) { duplicates++; continue }
+        existingKeys.add(k)
+        added.push(c)
+      }
+      if (duplicates > 0) {
+        setTimeout(() => alert(`${added.length} contact${added.length > 1 ? 's' : ''} importé${added.length > 1 ? 's' : ''}. ${duplicates} doublon${duplicates > 1 ? 's' : ''} ignoré${duplicates > 1 ? 's' : ''}.`), 50)
+      }
+      return [...prev, ...added]
+    })
   }, [])
 
   const handleUpdateContact = useCallback((id, updates) => {
@@ -1634,6 +1796,8 @@ export default function App() {
         isOpen={showScraper}
         onClose={() => setShowScraper(false)}
         onImport={handleImportContacts}
+        tags={tags}
+        onAddTag={handleAddTag}
       />
 
       {/* CSV Import Modal */}
