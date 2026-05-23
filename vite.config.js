@@ -8,11 +8,17 @@ export default defineConfig({
     jsxImportSource: 'react',
   },
   server: {
+    port: 5174,
     proxy: {
       '/serpapi': {
         target: 'https://serpapi.com',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/serpapi/, ''),
+      },
+      '/pappers': {
+        target: 'https://api.pappers.fr',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/pappers/, ''),
       },
     },
   },
